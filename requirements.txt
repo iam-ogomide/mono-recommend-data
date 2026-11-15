@@ -2,3 +2,14 @@ pydantic==2.13.5
 python-dotenv==1.2.2
 google-genai==1.0.0
 pydantic>=2.6.0
+cryptography==50.0.1
+pytest>=8.0
+pymongo>=4.6
+psycopg[binary]>=3.1  # Postgres store
+pixeltable-pgserver
+nats-py>=2.9
+pytest-asyncio>=0.23 
+google-genai==1.0.0
+pyyaml==6.0.2
+psycopg[binary]==3.3.3
+redis==5.2.1

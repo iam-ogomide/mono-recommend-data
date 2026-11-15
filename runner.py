@@ -68,6 +68,14 @@ from credit import (
     create_bureau_snapshot,
     make_mongo_lookup,
 )
+from audit_logs import AuditLog, PostgresAuditStore, VaultAuditSink
+from vault import Caller, Grant, LocalKeyProvider, PiiField, Vault, VaultPolicy, lookup_key_from_env
+from vault.mongo_store import MongoVaultStore
+from vault.vault_adapter import (
+    VaultLookup,
+    make_mongo_token_resolver,
+    migrate_subscribers,
+)
 from rebound import (
     MongoRepaymentSource,
     RepaymentSource,
@@ -510,17 +518,28 @@ def run_daily(
 #     REPORT_MONGO_DB=...           # falls back to MONGO_DB
 #     REBOUND_MONGO_URI=...         # ReboundCliq repayment schedules (Step 3). Falls back to MONGO_URI.
 #     REBOUND_MONGO_DB=...          # falls back to MONGO_DB
+#     AUDIT_DATABASE_URL=...         # separate PostgreSQL database for the shared audit log
 #
 # Collection names:
 #     REPORT_SOURCE_COLLECTION=...  (required: where pulled reports are stored)
 #     SUBSCRIBERS_COLLECTION=...    (default: subscribers)
 #     REBOUND_COLLECTION=...        (default: rebound_repayment_schedules)
+#     VAULT_TOKENS_COLLECTION=...   (default: runner_vault_tokens)
+#
+# Development vault keys (stable secrets; lookup key must differ from every KEK):
+#     VAULT_KEKS=<key-id>:<base64-encoded 32-byte key>
+#     VAULT_KEK_CURRENT=<key-id>
+#     VAULT_LOOKUP_KEY=<base64-encoded key of at least 32 bytes>
 #
 # Examples:
 #     python runner.py --only SUB-0001,SUB-0002              dry run
 #     python runner.py --only SUB-0001 --write               also saves recommendations
 #     python runner.py --only SUB-0001 --llm gemini          needs GEMINI_MODEL and GEMINI_API_KEY
 #     python runner.py --setup                               creates the indexes first
+#     Apply audit_logs/audit_schema.sql to the separate PostgreSQL audit database first.
+#     python runner.py --migrate-vault                       inspect migration without writing
+#     python runner.py --migrate-vault --write-vault-migration --only SUB-0001
+#     python runner.py --only SUB-0001 --use-vault           resolve BVNs via the vault
 
 class CollectionNames(BaseModel):
     # inputs (read only)
@@ -532,6 +551,7 @@ class CollectionNames(BaseModel):
     snapshots: str = "runner_bureau_snapshots"
     recommendations: str = "runner_recommendations"
     decision_log: str = "runner_decision_log"
+    vault_tokens: str = "runner_vault_tokens"
 
     @classmethod
     def from_env(cls) -> "CollectionNames":
@@ -543,12 +563,21 @@ class CollectionNames(BaseModel):
             "snapshots": "RUNNER_SNAPSHOTS",
             "recommendations": "RUNNER_RECOMMENDATIONS",
             "decision_log": "RUNNER_DECISION_LOG",
+            "vault_tokens": "VAULT_TOKENS_COLLECTION",
         }
         return cls(**{k: os.environ[v] for k, v in mapping.items() if os.environ.get(v)})
 
     def check_outputs_are_separate_from_inputs(self) -> None:
         inputs = {self.subscribers, self.report_source, self.rebound_schedules}
-        for name in (self.snapshots, self.recommendations, self.decision_log):
+        outputs = (
+            self.snapshots,
+            self.recommendations,
+            self.decision_log,
+            self.vault_tokens,
+        )
+        if len(set(outputs)) != len(outputs):
+            raise ValueError("Runner output collections must have distinct names.")
+        for name in outputs:
             if name in inputs:
                 raise ValueError(f"Output collection {name!r} is also an input collection. "
                                  "The runner must never write into collections it reads from.")
@@ -561,6 +590,40 @@ class CollectionNames(BaseModel):
 def _as_utc(value: datetime) -> datetime:
     # pymongo returns naive datetimes (meaning UTC) unless tz_aware=True
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+def build_audit_log() -> AuditLog:
+    """Create the shared PostgreSQL audit log from the separate audit DSN."""
+    audit_dsn = os.environ.get("AUDIT_DATABASE_URL")
+    if not audit_dsn:
+        raise ValueError("Set AUDIT_DATABASE_URL to the separate PostgreSQL audit database.")
+    import psycopg
+
+    return AuditLog(PostgresAuditStore(lambda: psycopg.connect(audit_dsn)))
+
+
+def build_vault(db, names: CollectionNames) -> Vault:
+    """Build the development vault using durable MongoDB records and env-provided keys.
+
+    LocalKeyProvider is intentionally development-only. A production deployment must
+    replace it with a KMS provider and run the vault behind a service boundary.
+    """
+    return Vault(
+        MongoVaultStore(db[names.vault_tokens]),
+        LocalKeyProvider.from_env(),
+        lookup_key_from_env(),
+        VaultAuditSink(build_audit_log()),
+        VaultPolicy(
+            writers=frozenset({"migration-job"}),
+            grants=[
+                Grant(
+                    caller="creditchek-gateway",
+                    fields=frozenset({PiiField.BVN}),
+                    purposes=frozenset({"bureau_pull"}),
+                )
+            ],
+        ),
+    )
 
 
 class MongoRecommendationStore:
@@ -625,6 +688,7 @@ def build_mongo_deps(
     names: CollectionNames,
     llm,
     only: set[str] | None = None,
+    use_vault: bool = False,
 ) -> RunnerDeps:
     """Wire the runner to (possibly different) Mongo databases.
 
@@ -640,10 +704,18 @@ def build_mongo_deps(
     source = make_mongo_source(subscribers)
     if only:
         source = _OnlySource(source, only)
+    lookup = make_mongo_lookup(subscribers)
+    if use_vault:
+        vault = build_vault(main_db, names)
+        lookup = VaultLookup(
+            vault,
+            make_mongo_token_resolver(subscribers),
+            Caller("creditchek-gateway"),
+        )
 
     return RunnerDeps(
         subscribers=source,
-        lookup=make_mongo_lookup(subscribers),
+        lookup=lookup,
         report_service=StoredReportService(report_db[names.report_source]),
         snapshots=MongoSnapshotStore(main_db[names.snapshots]),
         repayments=MongoRepaymentSource(
@@ -664,6 +736,7 @@ def setup_indexes(db, names: CollectionNames) -> None:
     db[names.recommendations].create_index([("subscriber_id", 1), ("created_at", -1)])
     db[names.recommendations].create_index("recommendation_id", unique=True)
     db[names.decision_log].create_index([("run_id", 1), ("subscriber_id", 1)])
+    MongoVaultStore(db[names.vault_tokens]).create_indexes()
 
 
 def run_with_db(
@@ -679,8 +752,11 @@ def run_with_db(
     publish: bool = False,
     max_tokens: int | None = None,
     now: datetime | None = None,
+    use_vault: bool = False,
 ) -> RunSummary:
-    deps = build_mongo_deps(main_db, report_db, rebound_db, names, llm or FakeLLM(), only)
+    deps = build_mongo_deps(
+        main_db, report_db, rebound_db, names, llm or FakeLLM(), only, use_vault=use_vault
+    )
     cfg = RunnerConfig(dry_run=not write, auto_publish=publish, max_tokens_per_run=max_tokens)
     return run_daily(run_date, deps, cfg, now=now)
 
@@ -786,12 +862,42 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-tokens", type=int, help="token ceiling for the run")
     p.add_argument("--demo", action="store_true", help="run the offline fake demo and exit")
     p.add_argument("--setup", action="store_true", help="create indexes on the runner-owned collections")
+    p.add_argument(
+        "--use-vault",
+        action="store_true",
+        help="resolve BVNs from the vault instead of reading plaintext subscriber BVNs",
+    )
+    p.add_argument(
+        "--migrate-vault",
+        action="store_true",
+        help="validate/copy subscriber BVNs into the vault (dry run unless write is enabled)",
+    )
+    p.add_argument(
+        "--write-vault-migration",
+        action="store_true",
+        help="write vault tokens and subscriber pii_token fields; requires --migrate-vault",
+    )
+    p.add_argument(
+        "--all-vault-migration",
+        action="store_true",
+        help="allow a write migration across all subscribers; otherwise specify --only",
+    )
     args = p.parse_args(argv)
 
     if args.demo:
         run_fake_e2e()
         return 0
 
+    if args.write_vault_migration and not args.migrate_vault:
+        p.error("--write-vault-migration requires --migrate-vault")
+    if args.all_vault_migration and not args.write_vault_migration:
+        p.error("--all-vault-migration requires --write-vault-migration")
+    if args.write_vault_migration and not args.only and not args.all_vault_migration:
+        p.error("specify --only for a scoped migration or --all-vault-migration to migrate all")
+    if args.only and args.all_vault_migration:
+        p.error("--only and --all-vault-migration cannot be used together")
+    if args.migrate_vault and args.use_vault:
+        p.error("vault migration and --use-vault are separate operations")
 
     if not uri or not db_name:
         print("Set MONGO_URI and MONGO_DB first (see the MongoDB section in runner.py).")
@@ -802,7 +908,8 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(exc)
         return 2
-    if not names.report_source:
+    migration_mode = args.migrate_vault
+    if not migration_mode and not names.report_source:
         print("Set REPORT_SOURCE_COLLECTION to the collection that holds the pulled reports.")
         return 2
 
@@ -827,6 +934,33 @@ def main(argv: list[str] | None = None) -> int:
 
     main_client, main_db = _connect("main", uri, db_name)
 
+    if args.setup:
+        setup_indexes(main_db, names)
+        print("Indexes created on main database.")
+
+    only = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else None
+    if migration_mode:
+        vault = None
+        if args.write_vault_migration:
+            vault = build_vault(main_db, names)
+            MongoVaultStore(main_db[names.vault_tokens]).create_indexes()
+        report = migrate_subscribers(
+            main_db[names.subscribers],
+            vault,
+            Caller("migration-job"),
+            write=args.write_vault_migration,
+            subscriber_ids=None if args.all_vault_migration else only,
+        )
+        mode = "written" if args.write_vault_migration else "dry run"
+        print(
+            f"Vault migration ({mode}): scanned={report.scanned}, "
+            f"tokenized={report.tokenized}, already_tokenized={report.already_tokenized}, "
+            f"invalid_bvn={len(report.invalid_bvn)}, dropped_optional_values={len(report.dropped_extras)}"
+        )
+        if args.write_vault_migration:
+            print("Plaintext BVN fields were left unchanged.")
+        return 0
+
     # Re-use the main client when the URI is the same (avoids extra connections).
     if report_uri == uri:
         report_db = main_client[report_db_name]
@@ -848,16 +982,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  writes : {names.snapshots}, {names.decision_log}"
           + (f", {names.recommendations}" if args.write else f"  ({names.recommendations}: dry run, not written)"))
 
-    if args.setup:
-        setup_indexes(main_db, names)
-        print("Indexes created on main database.")
-
-    only = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else None
     run_date = date.fromisoformat(args.date) if args.date else wat_today()
     summary = run_with_db(
         main_db, report_db, rebound_db, names, run_date,
         llm=llm, only=only, write=args.write,
         publish=args.publish, max_tokens=args.max_tokens,
+        use_vault=args.use_vault,
     )
     _print_summary(summary, args.write)
     return 0

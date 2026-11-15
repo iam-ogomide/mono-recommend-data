@@ -98,6 +98,7 @@ class BureauSnapshot(BaseModel):
     snapshot_date: date
     score: int | None = None  # None when the bureau gave no usable score
     non_performing_count: int = 0  # facilities marked non-performing on this report
+    flags: list[str] = Field(default_factory=list)
 
 
 class RepaymentSummary(BaseModel):
